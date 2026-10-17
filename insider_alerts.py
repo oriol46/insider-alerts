@@ -54,9 +54,10 @@ CONFIG = {
     "cluster_window_days": 30,
     "cluster_min_insiders": 2,
 
-    # Ventas (desactivado por defecto: mucho ruido)
-    "alert_sells": False,
-    "min_sell_value": 5_000_000,
+    # Ventas en mercado abierto (código S). También se excluyen las de planes 10b5-1.
+    "alert_sells": True,
+    "min_sell_value": 1_000_000,      # importe mínimo de la venta en USD
+    "min_pct_sold": 0,                # % mínimo de la posición vendida (0 = sin filtro)
 
     # Incluir enmiendas (4/A)
     "include_amendments": False,
@@ -469,6 +470,10 @@ def summarize(doc, code):
         bought = sum(t["shares"] for t in same)
         prior = last["post"] - bought
         pct = float("inf") if prior <= 0 else bought / prior * 100
+    elif code == "S" and last["post"] is not None:
+        sold = sum(t["shares"] for t in same)
+        prior = last["post"] + sold
+        pct = sold / prior * 100 if prior > 0 else None
     return {
         "shares": shares, "value": value, "avg_price": value / shares if shares else 0,
         "pct": pct, "post": last["post"], "direct": last["direct"],
@@ -518,8 +523,12 @@ def build_message(doc, s, f, side, cluster=None):
              f"💵 <b>{fmt_money(s['value'])}</b> · {fmt_num(s['shares'])} acc. a {fmt_num(s['avg_price'], 2)} $"]
     if s["pct"] is not None:
         tipo = "directa" if s["direct"] else "indirecta"
-        pct = "nueva posición" if s["pct"] == float("inf") else f"+{fmt_num(s['pct'], 1)}% sobre su posición"
-        lines.append(f"📈 {pct} ({tipo})")
+        if side == "P":
+            pct = "nueva posición" if s["pct"] == float("inf") else f"+{fmt_num(s['pct'], 1)}% sobre su posición"
+            lines.append(f"📈 {pct} ({tipo})")
+        else:
+            pct = "vende TODA su posición" if s["pct"] >= 99.95 else f"vende el {fmt_num(s['pct'], 1)}% de su posición"
+            lines.append(f"📉 {pct} ({tipo})")
     if cluster:
         lines.append(f"👥 {cluster['n']} insiders comprando en {CONFIG['cluster_window_days']} días "
                      f"· total {fmt_money(cluster['total'])}")
@@ -571,7 +580,8 @@ def process_filing(con, doc, f, dry_run=False, index_map=None):
 
     if CONFIG["alert_sells"]:
         sell = summarize(doc, "S")
-        if sell and sell["value"] >= CONFIG["min_sell_value"]:
+        if sell and sell["value"] >= CONFIG["min_sell_value"] and \
+                (not CONFIG["min_pct_sold"] or (sell["pct"] or 0) >= CONFIG["min_pct_sold"]):
             send_telegram(build_message(doc, sell, f, "S"), dry_run)
             sent += 1
     return sent
