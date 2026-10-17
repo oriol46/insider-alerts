@@ -37,9 +37,27 @@ Todo está en el bloque `CONFIG` al principio de `insider_alerts.py`:
 | `roles` | todos | `officer`, `director`, `ten_percent` |
 | `watchlist` | vacía | Si tiene tickers, solo avisa de esos |
 | `cluster_window_days` / `cluster_min_insiders` | 30 / 2 | Definición de cluster |
-| `alert_sells` / `min_sell_value` | `False` / 5M $ | Avisos de ventas grandes |
+| `alert_sells` / `min_sell_value` / `min_pct_sold` | `True` / 100.000 $ / 0 | Avisos de ventas |
+| `indices` | SP500, NDX100, R2000 | Solo empresas de estos índices (`SP400` disponible) |
+| `min_score` | 0 | Puntuación mínima para avisar |
+| `weekly_digest` | `True` | Resumen semanal (sábado ~9:00) |
 
-Solo se tienen en cuenta compras en mercado abierto (código **P**). Las ventas usan el código **S**.
+Solo se tienen en cuenta operaciones en mercado abierto: compras (código **P**) y ventas (código **S**).
+
+## Puntuación (0–100)
+
+| Factor | Puntos |
+|---|---|
+| Cargo: CEO/CFO/COO/Presidente/Chairman | 25 |
+| Cargo: otro directivo / consejero / accionista >10% | 15 / 12 / 5 |
+| Importe: ≥1 M$ / ≥500k / ≥250k / ≥100k | 20 / 15 / 10 / 5 |
+| % de la capitalización: ≥0,1% / ≥0,05% / ≥0,01% | 15 / 10 / 5 |
+| Compras — aumento de posición: ≥50% (o nueva) / ≥20% / ≥10% / ≥5% | 20 / 15 / 10 / 5 |
+| Compras — cluster: 3+ insiders / 2 insiders | 20 / 12 |
+| Compras — caída desde máx. 52s: ≥30% / ≥15% | 10 / 5 |
+| Ventas — % de la posición vendida: todo / ≥50% / ≥25% / ≥10% | 30 / 20 / 12 / 6 |
+
+🔥 ≥20 · 🔥🔥 ≥40 · 🔥🔥🔥 ≥60. Para enviar el resumen semanal en cualquier momento: `python insider_alerts.py --digest`.
 
 ## 4. Ponerlo en marcha de forma continua
 

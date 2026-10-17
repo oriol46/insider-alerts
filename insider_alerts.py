@@ -10,6 +10,7 @@ Uso:
     python insider_alerts.py --loop 600   # en bucle, cada 600 s (para un VPS)
     python insider_alerts.py --dry-run    # imprime los avisos en vez de enviarlos
     python insider_alerts.py --test       # envía un mensaje de prueba a Telegram
+    python insider_alerts.py --digest     # envía ahora el resumen semanal
 """
 
 import argparse
@@ -62,6 +63,15 @@ CONFIG = {
     # Contexto en cada aviso: sector, capitalización, precio actual y rango de 52 semanas
     "enrich": True,
 
+    # Puntuación (0-100): 🔥 ≥20 · 🔥🔥 ≥40 · 🔥🔥🔥 ≥60
+    "min_score": 0,                   # solo avisar si la puntuación llega a este mínimo (0 = todos)
+
+    # Resumen semanal por Telegram (hora en UTC: 7 = 9:00 en verano / 8:00 en invierno en España)
+    "weekly_digest": True,
+    "digest_weekday": 5,              # 0 = lunes … 5 = sábado, 6 = domingo
+    "digest_hour_utc": 7,
+    "digest_top_n": 5,                # nº de compras y ventas destacadas
+
     # Incluir enmiendas (4/A)
     "include_amendments": False,
 
@@ -86,7 +96,7 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 INDEX_SOURCES = {
     "SP500": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", 450, "S&P 500"),
     "SP400": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", 350, "S&P 400"),
-    "NDX100": ("wiki", "https://en.wikipedia.org/wiki/Nasdaq-100", 90, "Nasdaq-100"),
+    "NDX100": ("nasdaq", "https://en.wikipedia.org/wiki/Nasdaq-100", 90, "Nasdaq-100"),
     "R2000": ("ishares", "https://www.ishares.com/us/products/239710/x/latest-holdings.csv",
               1500, "Russell 2000"),
 }
@@ -176,6 +186,10 @@ def db_open(path):
             key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS company_info (
             cik TEXT PRIMARY KEY, shares REAL, sic TEXT, updated TEXT);
+        CREATE TABLE IF NOT EXISTS trades (
+            accession TEXT, side TEXT, issuer_cik TEXT, ticker TEXT, owner TEXT,
+            trade_date TEXT, value REAL, pct REAL, score INTEGER, alerted_at TEXT,
+            PRIMARY KEY (accession, side));
     """)
     # Migración: columna de sector en bases creadas con versiones anteriores
     cols = [r[1] for r in con.execute("PRAGMA table_info(index_members)")]
@@ -279,9 +293,23 @@ def parse_ishares_members(text):
     return rows
 
 
+def _fetch_nasdaq100(http):
+    r = http.get(NASDAQ100_FALLBACK, timeout=30)
+    data = r.json()["data"]["data"]["rows"]
+    return [(norm_ticker(x["symbol"]), None, x.get("sector") or None) for x in data if x.get("symbol")]
+
+
 def _fetch_index(key, http):
     kind, url, min_rows, _ = INDEX_SOURCES[key]
     rows = []
+    if kind == "nasdaq":  # Nasdaq-100: primero la web oficial de Nasdaq, Wikipedia de respaldo
+        try:
+            rows = _fetch_nasdaq100(http)
+        except Exception as ex:
+            log.info("Índice NDX100: web de Nasdaq no disponible (%s), probando Wikipedia", ex)
+        if len(rows) >= min_rows:
+            return rows
+        kind = "wiki"
     try:
         r = http.get(url, timeout=30)
         r.raise_for_status()
@@ -290,14 +318,6 @@ def _fetch_index(key, http):
             log.warning("Índice %s: respuesta inesperada, empieza por: %r", key, r.text[:80])
     except Exception as ex:
         log.warning("Índice %s: error descargando (%s)", key, ex)
-    if key == "NDX100" and len(rows) < min_rows:  # plan B: web de Nasdaq
-        try:
-            r = http.get(NASDAQ100_FALLBACK, timeout=30)
-            data = r.json()["data"]["data"]["rows"]
-            rows = [(norm_ticker(x["symbol"]), None, x.get("sector") or None)
-                    for x in data if x.get("symbol")]
-        except Exception as ex:
-            log.warning("Índice NDX100: fallo también en la fuente alternativa (%s)", ex)
     if len(rows) < min_rows:
         log.warning("Índice %s: lista incompleta (%d valores), se mantiene la anterior", key, len(rows))
         return None
@@ -443,6 +463,56 @@ def build_context(sec, con, http, doc, s):
         if px["lo"]:
             ctx["from_lo"] = (px["price"] / px["lo"] - 1) * 100
     return ctx
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Puntuación de relevancia (0-100)
+# ═══════════════════════════════════════════════════════════════════════
+TOP_ROLE = re.compile(r"\b(CEO|CFO|COO|PRESIDENT|CHAIR|CHIEF EXECUTIVE|CHIEF FINANCIAL|CHIEF OPERATING|FOUNDER)", re.I)
+
+
+def _role_points(doc):
+    best = 0
+    for o in doc["owners"]:
+        if o["officer"] and TOP_ROLE.search(o["title"] or ""):
+            pts = 25
+        elif o["officer"]:
+            pts = 15
+        elif o["director"]:
+            pts = 12
+        elif o["ten_percent"]:
+            pts = 5
+        else:
+            pts = 0
+        best = max(best, pts)
+    return best
+
+
+def _tier(x, tiers):
+    """Devuelve los puntos del primer umbral que se supera: tiers = [(umbral, puntos), ...]."""
+    for threshold, pts in tiers:
+        if x is not None and x >= threshold:
+            return pts
+    return 0
+
+
+def score_trade(doc, s, side, ctx, cluster):
+    pts = _role_points(doc)
+    pts += _tier(s["value"], [(1_000_000, 20), (500_000, 15), (250_000, 10), (100_000, 5)])
+    pts += _tier(ctx.get("pct_mcap"), [(0.1, 15), (0.05, 10), (0.01, 5)])
+    if side == "P":
+        pts += _tier(s["pct"], [(50, 20), (20, 15), (10, 10), (5, 5)])  # nueva posición = inf
+        if cluster:
+            pts += 20 if cluster["n"] >= 3 else 12
+        dd = ctx.get("from_hi")
+        pts += _tier(-dd if dd is not None else None, [(30, 10), (15, 5)])  # compra tras caída
+    else:
+        pts += _tier(s["pct"], [(99.95, 30), (50, 20), (25, 12), (10, 6)])
+    return min(100, pts)
+
+
+def fires(score):
+    return "🔥🔥🔥" if score >= 60 else "🔥🔥" if score >= 40 else "🔥" if score >= 20 else ""
 
 
 def fmt_cap(x):
@@ -616,7 +686,7 @@ def cluster_info(con, doc, s):
 # ═══════════════════════════════════════════════════════════════════════
 # Mensajes
 # ═══════════════════════════════════════════════════════════════════════
-def build_message(doc, s, f, side, cluster=None, ctx=None):
+def build_message(doc, s, f, side, cluster=None, ctx=None, score=None):
     e = html.escape
     ctx = ctx or {}
     owners = doc["owners"]
@@ -626,7 +696,8 @@ def build_message(doc, s, f, side, cluster=None, ctx=None):
 
     head = "🟢 <b>COMPRA INSIDER</b>" if side == "P" else "🔴 <b>VENTA INSIDER</b>"
     ticker = e(doc["ticker"] or "s/ticker")
-    lines = [f"{head} — <b>${ticker}</b>" + ("  🔥 <b>CLUSTER</b>" if cluster else ""),
+    flame = f"  {fires(score)}" if score is not None and fires(score) else ""
+    lines = [f"{head} — <b>${ticker}</b>{flame}" + ("  👥 <b>CLUSTER</b>" if cluster else ""),
              e(doc["issuer_name"]) + (f"  ·  🏷️ {e(' · '.join(doc['indices']))}" if doc.get("indices") else "")]
 
     # Sector y capitalización
@@ -642,7 +713,7 @@ def build_message(doc, s, f, side, cluster=None, ctx=None):
     value = f"💵 <b>{fmt_money(s['value'])}</b>"
     if ctx.get("pct_mcap") is not None:
         p = ctx["pct_mcap"]
-        value += " (<0,01% de la cap.)" if p < 0.01 else f" ({fmt_num(p, 2)}% de la cap.)"
+        value += " (&lt;0,01% de la cap.)" if p < 0.01 else f" ({fmt_num(p, 2)}% de la cap.)"
     lines.append(f"{value} · {fmt_num(s['shares'])} acc. a {fmt_num(s['avg_price'], 2)} $")
 
     if s["pct"] is not None:
@@ -671,6 +742,8 @@ def build_message(doc, s, f, side, cluster=None, ctx=None):
         if rng:
             lines.append("📐 " + " · ".join(rng))
 
+    if score is not None:
+        lines.append(f"⭐ Puntuación: {score}/100")
     lines.append(f"📅 Operación: {s['date'] or '?'} · Presentado: {f['filed'] or '?'}")
     links = [f"<a href=\"{e(f['index_url'])}\">EDGAR</a>"]
     if doc["ticker"]:
@@ -720,24 +793,114 @@ def process_filing(con, doc, f, dry_run=False, index_map=None, sec=None, http=No
     if index_map and not doc["indices"]:
         return 0  # no está en ninguno de los índices elegidos
     sent = 0
+    owner = " / ".join(o["name"] for o in doc["owners"])
+    role = "; ".join(role_label(o) for o in doc["owners"])
+
+    def alert(side, s, cluster=None):
+        ctx = context(s)
+        score = score_trade(doc, s, side, ctx, cluster)
+        if score < CONFIG["min_score"]:
+            return 0
+        con.execute("INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (f["accession"], side, doc["issuer_cik"], doc["ticker"], f"{owner} ({role})",
+                     s["date"], s["value"], None if s["pct"] == float("inf") else s["pct"], score,
+                     datetime.now(timezone.utc).isoformat()))
+        con.commit()
+        send_telegram(build_message(doc, s, f, side, cluster, ctx, score), dry_run)
+        return 1
 
     buy = summarize(doc, "P")
     if buy and buy["value"] >= CONFIG["min_buy_value"] and \
             (not CONFIG["min_pct_increase"] or (buy["pct"] or 0) >= CONFIG["min_pct_increase"]):
-        owner = " / ".join(o["name"] for o in doc["owners"])
         con.execute("INSERT OR IGNORE INTO buys VALUES (?,?,?,?,?,?)",
                     (f["accession"], doc["issuer_cik"], doc["ticker"], owner, buy["date"], buy["value"]))
         con.commit()
-        send_telegram(build_message(doc, buy, f, "P", cluster_info(con, doc, buy), context(buy)), dry_run)
-        sent += 1
+        sent += alert("P", buy, cluster_info(con, doc, buy))
 
     if CONFIG["alert_sells"]:
         sell = summarize(doc, "S")
         if sell and sell["value"] >= CONFIG["min_sell_value"] and \
                 (not CONFIG["min_pct_sold"] or (sell["pct"] or 0) >= CONFIG["min_pct_sold"]):
-            send_telegram(build_message(doc, sell, f, "S", ctx=context(sell)), dry_run)
-            sent += 1
+            sent += alert("S", sell)
     return sent
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Resumen semanal
+# ═══════════════════════════════════════════════════════════════════════
+def build_digest(con, days=7):
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = con.execute("SELECT side, issuer_cik, ticker, owner, value, pct, score FROM trades "
+                       "WHERE alerted_at >= ?", (since,)).fetchall()
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+    e = html.escape
+    lines = [f"📋 <b>RESUMEN SEMANAL INSIDERS</b> ({start:%d/%m} – {end:%d/%m})"]
+    if not rows:
+        lines.append("\nSin operaciones que pasaran los filtros esta semana.")
+        return "\n".join(lines)
+
+    buys = [r for r in rows if r[0] == "P"]
+    sells = [r for r in rows if r[0] == "S"]
+    n = CONFIG["digest_top_n"]
+
+    def line(i, r):
+        side, _, tk, owner, value, pct, score = r
+        if side == "P":
+            p = "nueva posición" if pct is None else f"+{fmt_num(pct, 1 if pct < 10 else 0)}% posición"
+        else:
+            p = "" if pct is None else ("vende TODO" if pct >= 99.95 else f"vende el {fmt_num(pct, 0)}%")
+        fl = fires(score or 0)
+        return f"{i}. {fl + ' ' if fl else ''}<b>${e(tk or '?')}</b> {fmt_money(value)} · {e(owner)}" + (f" · {p}" if p else "")
+
+    if buys:
+        lines.append("\n🟢 <b>TOP COMPRAS</b>")
+        for i, r in enumerate(sorted(buys, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
+            lines.append(line(i, r))
+
+    # Clusters: empresas con 2+ insiders distintos comprando en la semana
+    by_issuer = {}
+    for r in buys:
+        d = by_issuer.setdefault(r[1] or r[2], {"tk": r[2], "owners": set(), "total": 0})
+        d["owners"].add(r[3]); d["total"] += r[4]
+    clusters = sorted((d for d in by_issuer.values() if len(d["owners"]) >= 2),
+                      key=lambda d: (len(d["owners"]), d["total"]), reverse=True)
+    if clusters:
+        lines.append("\n👥 <b>CLUSTERS</b>")
+        for d in clusters[:n]:
+            lines.append(f"• <b>${e(d['tk'] or '?')}</b>: {len(d['owners'])} insiders · {fmt_money(d['total'])}")
+
+    if sells:
+        lines.append("\n🔴 <b>TOP VENTAS</b>")
+        for i, r in enumerate(sorted(sells, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
+            lines.append(line(i, r))
+
+    buyers = {r[3] for r in buys}
+    sellers = {r[3] for r in sells}
+    nb, ns = len(buys), len(sells)
+    lines.append(f"\n📊 Semana: {nb} compra{'s' if nb != 1 else ''} ({fmt_money(sum(r[4] for r in buys))}) · "
+                 f"{ns} venta{'s' if ns != 1 else ''} ({fmt_money(sum(r[4] for r in sells))})")
+    if sellers:
+        lines.append(f"Ratio compradores/vendedores: {fmt_num(len(buyers) / len(sellers), 2)}")
+    return "\n".join(lines)
+
+
+def maybe_send_digest(con, dry_run=False, force=False):
+    if not (CONFIG["weekly_digest"] or force):
+        return
+    now = datetime.now(timezone.utc)
+    week = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]}"
+    if not force:
+        if now.weekday() != CONFIG["digest_weekday"] or now.hour < CONFIG["digest_hour_utc"]:
+            return
+        row = con.execute("SELECT value FROM meta WHERE key='last_digest'").fetchone()
+        if row and row[0] == week:
+            return
+    send_telegram(build_digest(con), dry_run)
+    if not dry_run:
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('last_digest', ?)", (week,))
+        con.commit()
+    log.info("Resumen semanal enviado")
 
 
 def run_once(dry_run=False):
@@ -760,6 +923,10 @@ def run_once(dry_run=False):
         except Exception as ex:  # se reintentará en la próxima pasada
             log.warning("Error en %s: %s", f["accession"], ex)
     log.info("Avisos enviados: %d", alerts)
+    try:
+        maybe_send_digest(con, dry_run)
+    except Exception as ex:
+        log.warning("Error en el resumen semanal: %s", ex)
     con.close()
 
 
@@ -768,9 +935,15 @@ def main():
     ap.add_argument("--loop", type=int, metavar="SEG", help="ejecutar en bucle cada SEG segundos")
     ap.add_argument("--dry-run", action="store_true", help="imprimir avisos en vez de enviarlos")
     ap.add_argument("--test", action="store_true", help="enviar mensaje de prueba a Telegram")
+    ap.add_argument("--digest", action="store_true", help="enviar ahora el resumen semanal")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    if args.digest:
+        con = db_open(CONFIG["db_path"])
+        maybe_send_digest(con, args.dry_run, force=True)
+        con.close()
+        return
     if args.test:
         send_telegram("✅ <b>Insider alerts</b> conectado correctamente.")
         print("Mensaje de prueba enviado.")
