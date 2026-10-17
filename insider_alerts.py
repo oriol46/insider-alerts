@@ -13,7 +13,9 @@ Uso:
 """
 
 import argparse
+import csv
 import html
+import json
 import logging
 import os
 import re
@@ -22,6 +24,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 
 import requests
 
@@ -37,7 +40,14 @@ CONFIG = {
     # Roles que se tienen en cuenta: "officer", "director", "ten_percent"
     "roles": ["officer", "director", "ten_percent"],
 
+    # Índices: solo se avisa de empresas que estén en ALGUNO de estos.
+    # Disponibles: "SP500", "NDX100" (Nasdaq-100), "R2000" (Russell 2000), "SP400" (mid caps)
+    # Lista vacía [] = todas las empresas.
+    "indices": ["SP500", "NDX100", "R2000"],
+    "index_refresh_hours": 24,        # cada cuánto se actualizan las listas
+
     # Watchlist opcional: si tiene tickers, solo se avisa de esas empresas
+    # (si usas watchlist e índices a la vez, se exigen las dos condiciones)
     "watchlist": [],                  # p. ej. ["AAPL", "MSFT", "NVDA"]
 
     # Cluster buying: varios insiders comprando la misma empresa
@@ -67,6 +77,20 @@ FEED_URL = (
     "&company=&dateb=&owner=include&start={start}&count=100&output=atom"
 )
 ATOM = "{http://www.w3.org/2005/Atom}"
+
+# Fuentes de los componentes de cada índice: (tipo, url, mínimo de filas válido, etiqueta)
+INDEX_SOURCES = {
+    "SP500": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", 450, "S&P 500"),
+    "SP400": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", 350, "S&P 400"),
+    "NDX100": ("wiki", "https://en.wikipedia.org/wiki/Nasdaq-100", 90, "Nasdaq-100"),
+    "R2000": ("ishares",
+              "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+              "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+              1500, "Russell 2000"),
+}
+NASDAQ100_FALLBACK = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 log = logging.getLogger("insider")
 
@@ -144,6 +168,10 @@ def db_open(path):
             accession TEXT PRIMARY KEY, issuer_cik TEXT, ticker TEXT,
             owner TEXT, trade_date TEXT, value REAL);
         CREATE INDEX IF NOT EXISTS buys_issuer ON buys(issuer_cik, trade_date);
+        CREATE TABLE IF NOT EXISTS index_members (
+            idx TEXT, ticker TEXT, cik TEXT);
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY, value TEXT);
     """)
     return con
 
@@ -156,6 +184,166 @@ def db_mark(con, acc):
     con.execute("INSERT OR IGNORE INTO seen VALUES (?, ?)",
                 (acc, datetime.now(timezone.utc).isoformat()))
     con.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Componentes de índices (S&P 500, Nasdaq-100, Russell 2000, S&P 400)
+# ═══════════════════════════════════════════════════════════════════════
+def norm_ticker(t):
+    """BRK.B, BRK-B, BRK/B → BRKB, para comparar tickers de fuentes distintas."""
+    return re.sub(r"[^A-Z0-9]", "", (t or "").upper())
+
+
+class _TableParser(HTMLParser):
+    """Extrae las tablas de una página HTML como listas de filas de texto."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables, self._stack, self._row, self._cell = [], [], None, None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._stack.append([])
+        elif tag == "tr" and self._stack:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            text = re.sub(r"\[[^\]]*\]", "", "".join(self._cell))  # quita notas [1]
+            self._row.append(" ".join(text.split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._stack:
+            if self._row:
+                self._stack[-1].append(self._row)
+            self._row = None
+        elif tag == "table" and self._stack:
+            self.tables.append(self._stack.pop())
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def parse_wiki_members(html_text, min_rows):
+    """Busca la tabla de componentes (columna Symbol/Ticker) en una página de Wikipedia."""
+    p = _TableParser()
+    p.feed(html_text)
+    for t in p.tables:
+        if len(t) < min_rows:
+            continue
+        head = [h.lower() for h in t[0]]
+        col = next((i for i, h in enumerate(head) if h in ("symbol", "ticker", "ticker symbol")), None)
+        if col is None:
+            continue
+        cik_col = next((i for i, h in enumerate(head) if h == "cik"), None)
+        tickers, ciks = set(), set()
+        for r in t[1:]:
+            if len(r) > col and r[col]:
+                tickers.add(norm_ticker(r[col]))
+            if cik_col is not None and len(r) > cik_col and r[cik_col].isdigit():
+                ciks.add(r[cik_col].lstrip("0"))
+        tickers.discard("")
+        return tickers, ciks
+    return set(), set()
+
+
+def parse_ishares_members(text):
+    """Lee el CSV de posiciones de un ETF de iShares (solo acciones)."""
+    lines = text.lstrip("﻿").splitlines()
+    start = next((i for i, l in enumerate(lines) if l.lstrip('"').startswith("Ticker")), None)
+    if start is None:
+        return set(), set()
+    tickers = set()
+    for row in csv.DictReader(lines[start:]):
+        if (row.get("Asset Class") or "").strip() != "Equity":
+            continue
+        t = norm_ticker(row.get("Ticker"))
+        if t:
+            tickers.add(t)
+    return tickers, set()
+
+
+def _fetch_index(key, http):
+    kind, url, min_rows, _ = INDEX_SOURCES[key]
+    tickers, ciks = set(), set()
+    try:
+        r = http.get(url, timeout=30)
+        r.raise_for_status()
+        if kind == "wiki":
+            tickers, ciks = parse_wiki_members(r.text, min_rows)
+        else:
+            tickers, ciks = parse_ishares_members(r.text)
+    except Exception as ex:
+        log.warning("Índice %s: error descargando (%s)", key, ex)
+    if key == "NDX100" and len(tickers) < min_rows:  # plan B: web de Nasdaq
+        try:
+            r = http.get(NASDAQ100_FALLBACK, timeout=30)
+            rows = r.json()["data"]["data"]["rows"]
+            tickers = {norm_ticker(x["symbol"]) for x in rows if x.get("symbol")}
+        except Exception as ex:
+            log.warning("Índice NDX100: fallo también en la fuente alternativa (%s)", ex)
+    if len(tickers) < min_rows:
+        log.warning("Índice %s: lista incompleta (%d valores), se mantiene la anterior", key, len(tickers))
+        return None
+    return tickers, ciks
+
+
+def load_indices(sec: SEC, con):
+    """Devuelve {índice: (tickers, ciks)}, refrescando las listas si están viejas."""
+    wanted = [k for k in CONFIG["indices"] if k in INDEX_SOURCES]
+    for k in CONFIG["indices"]:
+        if k not in INDEX_SOURCES:
+            log.warning("Índice desconocido en CONFIG: %s", k)
+    if not wanted:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    stale = []
+    for k in wanted:
+        row = con.execute("SELECT value FROM meta WHERE key=?", (f"idx_{k}",)).fetchone()
+        if not row or now - datetime.fromisoformat(row[0]) > timedelta(hours=CONFIG["index_refresh_hours"]):
+            stale.append(k)
+
+    if stale:
+        http = requests.Session()
+        http.headers.update({"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
+        # Mapa ticker → CIK de la SEC, para cruzar por CIK (más fiable que el ticker)
+        tick2cik = {}
+        try:
+            data = json.loads(sec.get("https://www.sec.gov/files/company_tickers.json"))
+            tick2cik = {norm_ticker(v["ticker"]): str(v["cik_str"]) for v in data.values()}
+        except Exception as ex:
+            log.warning("No se pudo descargar company_tickers.json: %s", ex)
+        for k in stale:
+            res = _fetch_index(k, http)
+            if res is None:
+                continue
+            tickers, ciks = res
+            ciks |= {tick2cik[t] for t in tickers if t in tick2cik}
+            con.execute("DELETE FROM index_members WHERE idx=?", (k,))
+            con.executemany("INSERT INTO index_members VALUES (?,?,?)",
+                            [(k, t, None) for t in tickers] + [(k, None, c) for c in ciks])
+            con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"idx_{k}", now.isoformat()))
+            con.commit()
+            log.info("Índice %s actualizado: %d tickers", k, len(tickers))
+
+    out = {}
+    for k in wanted:
+        rows = con.execute("SELECT ticker, cik FROM index_members WHERE idx=?", (k,)).fetchall()
+        if rows:
+            out[k] = ({t for t, _ in rows if t}, {c for _, c in rows if c})
+        else:
+            log.warning("Índice %s sin datos: no se usará para filtrar", k)
+    return out
+
+
+def match_indices(doc, index_map):
+    """Etiquetas de los índices a los que pertenece la empresa del filing."""
+    t, c = norm_ticker(doc["ticker"]), doc["issuer_cik"]
+    return [INDEX_SOURCES[k][3] for k, (tickers, ciks) in index_map.items()
+            if (c and c in ciks) or (t and t in tickers)]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -325,7 +513,7 @@ def build_message(doc, s, f, side, cluster=None):
     head = "🟢 <b>COMPRA INSIDER</b>" if side == "P" else "🔴 <b>VENTA INSIDER</b>"
     ticker = e(doc["ticker"] or "s/ticker")
     lines = [f"{head} — <b>${ticker}</b>" + ("  🔥 <b>CLUSTER</b>" if cluster else ""),
-             e(doc["issuer_name"]),
+             e(doc["issuer_name"]) + (f"  ·  🏷️ {e(' · '.join(doc['indices']))}" if doc.get("indices") else ""),
              f"👤 {who}",
              f"💵 <b>{fmt_money(s['value'])}</b> · {fmt_num(s['shares'])} acc. a {fmt_num(s['avg_price'], 2)} $"]
     if s["pct"] is not None:
@@ -362,10 +550,13 @@ def send_telegram(text, dry_run=False):
 # ═══════════════════════════════════════════════════════════════════════
 # Proceso principal
 # ═══════════════════════════════════════════════════════════════════════
-def process_filing(con, doc, f, dry_run=False):
+def process_filing(con, doc, f, dry_run=False, index_map=None):
     """Evalúa un Form 4 ya parseado. Devuelve el nº de avisos enviados."""
     if not passes_watchlist(doc) or not passes_role(doc):
         return 0
+    doc["indices"] = match_indices(doc, index_map or {})
+    if index_map and not doc["indices"]:
+        return 0  # no está en ninguno de los índices elegidos
     sent = 0
 
     buy = summarize(doc, "P")
@@ -390,13 +581,16 @@ def run_once(dry_run=False):
     sec = SEC(SEC_USER_AGENT, CONFIG["request_delay"])
     # En --dry-run se usa una base temporal: no marca nada como visto
     con = db_open(":memory:" if dry_run else CONFIG["db_path"])
+    index_map = load_indices(sec, con)
+    if CONFIG["indices"] and not index_map:
+        log.warning("No hay listas de índices disponibles: esta pasada NO filtra por índice")
     filings = fetch_new_filings(sec, con)
     log.info("Form 4 nuevos: %d", len(filings))
     alerts = 0
     for f in filings:
         try:
             doc = parse_form4(fetch_form4_xml(sec, f))
-            alerts += process_filing(con, doc, f, dry_run)
+            alerts += process_filing(con, doc, f, dry_run, index_map)
             db_mark(con, f["accession"])
         except Exception as ex:  # se reintentará en la próxima pasada
             log.warning("Error en %s: %s", f["accession"], ex)
