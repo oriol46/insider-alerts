@@ -1,0 +1,34 @@
+name: insider-alerts
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency: insider-alerts
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: insider.db
+          key: insider-db-${{ github.run_id }}
+          restore-keys: insider-db-
+      - run: python insider_alerts.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: insider.db
+          key: insider-db-${{ github.run_id }}
