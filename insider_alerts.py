@@ -83,9 +83,7 @@ INDEX_SOURCES = {
     "SP500": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", 450, "S&P 500"),
     "SP400": ("wiki", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", 350, "S&P 400"),
     "NDX100": ("wiki", "https://en.wikipedia.org/wiki/Nasdaq-100", 90, "Nasdaq-100"),
-    "R2000": ("ishares",
-              "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
-              "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+    "R2000": ("ishares", "https://www.ishares.com/us/products/239710/x/latest-holdings.csv",
               1500, "Russell 2000"),
 }
 NASDAQ100_FALLBACK = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
@@ -275,6 +273,8 @@ def _fetch_index(key, http):
             tickers, ciks = parse_wiki_members(r.text, min_rows)
         else:
             tickers, ciks = parse_ishares_members(r.text)
+        if not tickers:
+            log.warning("Índice %s: respuesta inesperada, empieza por: %r", key, r.text[:80])
     except Exception as ex:
         log.warning("Índice %s: error descargando (%s)", key, ex)
     if key == "NDX100" and len(tickers) < min_rows:  # plan B: web de Nasdaq
