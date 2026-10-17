@@ -72,6 +72,9 @@ CONFIG = {
     "digest_hour_utc": 7,
     "digest_top_n": 5,                # nº de compras y ventas destacadas
 
+    # Europa: operaciones de directivos (Holanda, Alemania, Suiza) — ver eu_alerts.py
+    "europe": True,
+
     # Incluir enmiendas (4/A)
     "include_amendments": False,
 
@@ -191,10 +194,14 @@ def db_open(path):
             trade_date TEXT, value REAL, pct REAL, score INTEGER, alerted_at TEXT,
             PRIMARY KEY (accession, side));
     """)
-    # Migración: columna de sector en bases creadas con versiones anteriores
+    # Migraciones de bases creadas con versiones anteriores
     cols = [r[1] for r in con.execute("PRAGMA table_info(index_members)")]
     if "sector" not in cols:
         con.execute("ALTER TABLE index_members ADD COLUMN sector TEXT")
+        con.commit()
+    cols = [r[1] for r in con.execute("PRAGMA table_info(trades)")]
+    if "region" not in cols:
+        con.execute("ALTER TABLE trades ADD COLUMN region TEXT DEFAULT 'US'")
         con.commit()
     return con
 
@@ -801,10 +808,11 @@ def process_filing(con, doc, f, dry_run=False, index_map=None, sec=None, http=No
         score = score_trade(doc, s, side, ctx, cluster)
         if score < CONFIG["min_score"]:
             return 0
-        con.execute("INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+        con.execute("INSERT OR REPLACE INTO trades (accession, side, issuer_cik, ticker, owner, trade_date, "
+                    "value, pct, score, alerted_at, region) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (f["accession"], side, doc["issuer_cik"], doc["ticker"], f"{owner} ({role})",
                      s["date"], s["value"], None if s["pct"] == float("inf") else s["pct"], score,
-                     datetime.now(timezone.utc).isoformat()))
+                     datetime.now(timezone.utc).isoformat(), "US"))
         con.commit()
         send_telegram(build_message(doc, s, f, side, cluster, ctx, score), dry_run)
         return 1
@@ -830,58 +838,68 @@ def process_filing(con, doc, f, dry_run=False, index_map=None, sec=None, http=No
 # ═══════════════════════════════════════════════════════════════════════
 def build_digest(con, days=7):
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    rows = con.execute("SELECT side, issuer_cik, ticker, owner, value, pct, score FROM trades "
-                       "WHERE alerted_at >= ?", (since,)).fetchall()
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days - 1)
     e = html.escape
-    lines = [f"📋 <b>RESUMEN SEMANAL INSIDERS</b> ({start:%d/%m} – {end:%d/%m})"]
-    if not rows:
-        lines.append("\nSin operaciones que pasaran los filtros esta semana.")
-        return "\n".join(lines)
-
-    buys = [r for r in rows if r[0] == "P"]
-    sells = [r for r in rows if r[0] == "S"]
     n = CONFIG["digest_top_n"]
+    lines = [f"📋 <b>RESUMEN SEMANAL INSIDERS</b> ({start:%d/%m} – {end:%d/%m})"]
+    any_rows = False
 
-    def line(i, r):
-        side, _, tk, owner, value, pct, score = r
-        if side == "P":
-            p = "nueva posición" if pct is None else f"+{fmt_num(pct, 1 if pct < 10 else 0)}% posición"
-        else:
-            p = "" if pct is None else ("vende TODO" if pct >= 99.95 else f"vende el {fmt_num(pct, 0)}%")
-        fl = fires(score or 0)
-        return f"{i}. {fl + ' ' if fl else ''}<b>${e(tk or '?')}</b> {fmt_money(value)} · {e(owner)}" + (f" · {p}" if p else "")
+    for region, title, sym in (("US", "🇺🇸 <b>EE. UU.</b>", "$"), ("EU", "🇪🇺 <b>EUROPA</b>", "€")):
+        rows = con.execute("SELECT side, issuer_cik, ticker, owner, value, pct, score FROM trades "
+                           "WHERE alerted_at >= ? AND COALESCE(region, 'US') = ?", (since, region)).fetchall()
+        if not rows:
+            continue
+        any_rows = True
+        money = lambda x: f"{fmt_num(x)} {sym}"
+        buys = [r for r in rows if r[0] == "P"]
+        sells = [r for r in rows if r[0] == "S"]
+        lines.append(f"\n━━━━━━━━━━━━\n{title}")
 
-    if buys:
-        lines.append("\n🟢 <b>TOP COMPRAS</b>")
-        for i, r in enumerate(sorted(buys, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
-            lines.append(line(i, r))
+        def line(i, r):
+            side, _, tk, owner, value, pct, score = r
+            if side == "P":
+                p = "" if region == "EU" else ("nueva posición" if pct is None
+                                               else f"+{fmt_num(pct, 1 if pct < 10 else 0)}% posición")
+            else:
+                p = "" if pct is None else ("vende TODO" if pct >= 99.95 else f"vende el {fmt_num(pct, 0)}%")
+            fl = fires(score or 0)
+            tag = f"${e(tk or '?')}" if region == "US" else e(tk or "?")
+            return f"{i}. {fl + ' ' if fl else ''}<b>{tag}</b> {money(value)} · {e(owner)}" + (f" · {p}" if p else "")
 
-    # Clusters: empresas con 2+ insiders distintos comprando en la semana
-    by_issuer = {}
-    for r in buys:
-        d = by_issuer.setdefault(r[1] or r[2], {"tk": r[2], "owners": set(), "total": 0})
-        d["owners"].add(r[3]); d["total"] += r[4]
-    clusters = sorted((d for d in by_issuer.values() if len(d["owners"]) >= 2),
-                      key=lambda d: (len(d["owners"]), d["total"]), reverse=True)
-    if clusters:
-        lines.append("\n👥 <b>CLUSTERS</b>")
-        for d in clusters[:n]:
-            lines.append(f"• <b>${e(d['tk'] or '?')}</b>: {len(d['owners'])} insiders · {fmt_money(d['total'])}")
+        if buys:
+            lines.append("\n🟢 <b>TOP COMPRAS</b>")
+            for i, r in enumerate(sorted(buys, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
+                lines.append(line(i, r))
 
-    if sells:
-        lines.append("\n🔴 <b>TOP VENTAS</b>")
-        for i, r in enumerate(sorted(sells, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
-            lines.append(line(i, r))
+        by_issuer = {}
+        for r in buys:
+            if r[3].startswith("Nombre no publicado"):
+                continue
+            d = by_issuer.setdefault(r[1] or r[2], {"tk": r[2], "owners": set(), "total": 0})
+            d["owners"].add(r[3]); d["total"] += r[4]
+        clusters = sorted((d for d in by_issuer.values() if len(d["owners"]) >= 2),
+                          key=lambda d: (len(d["owners"]), d["total"]), reverse=True)
+        if clusters:
+            lines.append("\n👥 <b>CLUSTERS</b>")
+            for d in clusters[:n]:
+                tag = f"${e(d['tk'] or '?')}" if region == "US" else e(d["tk"] or "?")
+                lines.append(f"• <b>{tag}</b>: {len(d['owners'])} insiders · {money(d['total'])}")
 
-    buyers = {r[3] for r in buys}
-    sellers = {r[3] for r in sells}
-    nb, ns = len(buys), len(sells)
-    lines.append(f"\n📊 Semana: {nb} compra{'s' if nb != 1 else ''} ({fmt_money(sum(r[4] for r in buys))}) · "
-                 f"{ns} venta{'s' if ns != 1 else ''} ({fmt_money(sum(r[4] for r in sells))})")
-    if sellers:
-        lines.append(f"Ratio compradores/vendedores: {fmt_num(len(buyers) / len(sellers), 2)}")
+        if sells:
+            lines.append("\n🔴 <b>TOP VENTAS</b>")
+            for i, r in enumerate(sorted(sells, key=lambda r: (r[6] or 0, r[4]), reverse=True)[:n], 1):
+                lines.append(line(i, r))
+
+        nb, ns = len(buys), len(sells)
+        lines.append(f"\n📊 Semana: {nb} compra{'s' if nb != 1 else ''} ({money(sum(r[4] for r in buys))}) · "
+                     f"{ns} venta{'s' if ns != 1 else ''} ({money(sum(r[4] for r in sells))})")
+        buyers, sellers = {r[3] for r in buys}, {r[3] for r in sells}
+        if sellers:
+            lines.append(f"Ratio compradores/vendedores: {fmt_num(len(buyers) / len(sellers), 2)}")
+
+    if not any_rows:
+        lines.append("\nSin operaciones que pasaran los filtros esta semana.")
     return "\n".join(lines)
 
 
@@ -923,6 +941,14 @@ def run_once(dry_run=False):
         except Exception as ex:  # se reintentará en la próxima pasada
             log.warning("Error en %s: %s", f["accession"], ex)
     log.info("Avisos enviados: %d", alerts)
+    if CONFIG["europe"]:
+        try:
+            import eu_alerts
+            eu_alerts.run(con, http, dry_run)
+        except ImportError:
+            log.info("eu_alerts.py no encontrado: se omite Europa")
+        except Exception as ex:
+            log.warning("Error en Europa: %s", ex)
     try:
         maybe_send_digest(con, dry_run)
     except Exception as ex:
