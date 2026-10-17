@@ -56,7 +56,7 @@ CONFIG = {
 
     # Ventas en mercado abierto (código S). También se excluyen las de planes 10b5-1.
     "alert_sells": True,
-    "min_sell_value": 1_000_000,      # importe mínimo de la venta en USD
+    "min_sell_value": 100_000,        # importe mínimo de la venta en USD
     "min_pct_sold": 0,                # % mínimo de la posición vendida (0 = sin filtro)
 
     # Incluir enmiendas (4/A)
