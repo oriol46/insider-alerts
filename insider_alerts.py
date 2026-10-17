@@ -59,6 +59,9 @@ CONFIG = {
     "min_sell_value": 100_000,        # importe mínimo de la venta en USD
     "min_pct_sold": 0,                # % mínimo de la posición vendida (0 = sin filtro)
 
+    # Contexto en cada aviso: sector, capitalización, precio actual y rango de 52 semanas
+    "enrich": True,
+
     # Incluir enmiendas (4/A)
     "include_amendments": False,
 
@@ -171,7 +174,14 @@ def db_open(path):
             idx TEXT, ticker TEXT, cik TEXT);
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS company_info (
+            cik TEXT PRIMARY KEY, shares REAL, sic TEXT, updated TEXT);
     """)
+    # Migración: columna de sector en bases creadas con versiones anteriores
+    cols = [r[1] for r in con.execute("PRAGMA table_info(index_members)")]
+    if "sector" not in cols:
+        con.execute("ALTER TABLE index_members ADD COLUMN sector TEXT")
+        con.commit()
     return con
 
 
@@ -226,7 +236,7 @@ class _TableParser(HTMLParser):
 
 
 def parse_wiki_members(html_text, min_rows):
-    """Busca la tabla de componentes (columna Symbol/Ticker) en una página de Wikipedia."""
+    """Tabla de componentes de Wikipedia → [(ticker, cik, sector)]."""
     p = _TableParser()
     p.feed(html_text)
     for t in p.tables:
@@ -237,61 +247,64 @@ def parse_wiki_members(html_text, min_rows):
         if col is None:
             continue
         cik_col = next((i for i, h in enumerate(head) if h == "cik"), None)
-        tickers, ciks = set(), set()
+        sec_col = next((i for i, h in enumerate(head) if "sector" in h), None)
+        if sec_col is None:
+            sec_col = next((i for i, h in enumerate(head) if "industry" in h and "sub" not in h), None)
+        rows = []
         for r in t[1:]:
-            if len(r) > col and r[col]:
-                tickers.add(norm_ticker(r[col]))
-            if cik_col is not None and len(r) > cik_col and r[cik_col].isdigit():
-                ciks.add(r[cik_col].lstrip("0"))
-        tickers.discard("")
-        return tickers, ciks
-    return set(), set()
+            tk = norm_ticker(r[col]) if len(r) > col else ""
+            if not tk:
+                continue
+            cik = (r[cik_col].lstrip("0")
+                   if cik_col is not None and len(r) > cik_col and r[cik_col].isdigit() else None)
+            sector = r[sec_col] if sec_col is not None and len(r) > sec_col and r[sec_col] else None
+            rows.append((tk, cik, sector))
+        return rows
+    return []
 
 
 def parse_ishares_members(text):
-    """Lee el CSV de posiciones de un ETF de iShares (solo acciones)."""
+    """CSV de posiciones de un ETF de iShares (solo acciones) → [(ticker, None, sector)]."""
     lines = text.lstrip("﻿").splitlines()
     start = next((i for i, l in enumerate(lines) if l.lstrip('"').startswith("Ticker")), None)
     if start is None:
-        return set(), set()
-    tickers = set()
+        return []
+    rows = []
     for row in csv.DictReader(lines[start:]):
         if (row.get("Asset Class") or "").strip() != "Equity":
             continue
-        t = norm_ticker(row.get("Ticker"))
-        if t:
-            tickers.add(t)
-    return tickers, set()
+        tk = norm_ticker(row.get("Ticker"))
+        if tk:
+            rows.append((tk, None, (row.get("Sector") or "").strip() or None))
+    return rows
 
 
 def _fetch_index(key, http):
     kind, url, min_rows, _ = INDEX_SOURCES[key]
-    tickers, ciks = set(), set()
+    rows = []
     try:
         r = http.get(url, timeout=30)
         r.raise_for_status()
-        if kind == "wiki":
-            tickers, ciks = parse_wiki_members(r.text, min_rows)
-        else:
-            tickers, ciks = parse_ishares_members(r.text)
-        if not tickers:
+        rows = parse_wiki_members(r.text, min_rows) if kind == "wiki" else parse_ishares_members(r.text)
+        if not rows:
             log.warning("Índice %s: respuesta inesperada, empieza por: %r", key, r.text[:80])
     except Exception as ex:
         log.warning("Índice %s: error descargando (%s)", key, ex)
-    if key == "NDX100" and len(tickers) < min_rows:  # plan B: web de Nasdaq
+    if key == "NDX100" and len(rows) < min_rows:  # plan B: web de Nasdaq
         try:
             r = http.get(NASDAQ100_FALLBACK, timeout=30)
-            rows = r.json()["data"]["data"]["rows"]
-            tickers = {norm_ticker(x["symbol"]) for x in rows if x.get("symbol")}
+            data = r.json()["data"]["data"]["rows"]
+            rows = [(norm_ticker(x["symbol"]), None, x.get("sector") or None)
+                    for x in data if x.get("symbol")]
         except Exception as ex:
             log.warning("Índice NDX100: fallo también en la fuente alternativa (%s)", ex)
-    if len(tickers) < min_rows:
-        log.warning("Índice %s: lista incompleta (%d valores), se mantiene la anterior", key, len(tickers))
+    if len(rows) < min_rows:
+        log.warning("Índice %s: lista incompleta (%d valores), se mantiene la anterior", key, len(rows))
         return None
-    return tickers, ciks
+    return rows
 
 
-def load_indices(sec: SEC, con):
+def load_indices(sec: SEC, con, http):
     """Devuelve {índice: (tickers, ciks)}, refrescando las listas si están viejas."""
     wanted = [k for k in CONFIG["indices"] if k in INDEX_SOURCES]
     for k in CONFIG["indices"]:
@@ -303,13 +316,11 @@ def load_indices(sec: SEC, con):
     now = datetime.now(timezone.utc)
     stale = []
     for k in wanted:
-        row = con.execute("SELECT value FROM meta WHERE key=?", (f"idx_{k}",)).fetchone()
+        row = con.execute("SELECT value FROM meta WHERE key=?", (f"idx2_{k}",)).fetchone()
         if not row or now - datetime.fromisoformat(row[0]) > timedelta(hours=CONFIG["index_refresh_hours"]):
             stale.append(k)
 
     if stale:
-        http = requests.Session()
-        http.headers.update({"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
         # Mapa ticker → CIK de la SEC, para cruzar por CIK (más fiable que el ticker)
         tick2cik = {}
         try:
@@ -318,17 +329,15 @@ def load_indices(sec: SEC, con):
         except Exception as ex:
             log.warning("No se pudo descargar company_tickers.json: %s", ex)
         for k in stale:
-            res = _fetch_index(k, http)
-            if res is None:
+            rows = _fetch_index(k, http)
+            if rows is None:
                 continue
-            tickers, ciks = res
-            ciks |= {tick2cik[t] for t in tickers if t in tick2cik}
             con.execute("DELETE FROM index_members WHERE idx=?", (k,))
-            con.executemany("INSERT INTO index_members VALUES (?,?,?)",
-                            [(k, t, None) for t in tickers] + [(k, None, c) for c in ciks])
-            con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"idx_{k}", now.isoformat()))
+            con.executemany("INSERT INTO index_members (idx, ticker, cik, sector) VALUES (?,?,?,?)",
+                            [(k, tk, cik or tick2cik.get(tk), sector) for tk, cik, sector in rows])
+            con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"idx2_{k}", now.isoformat()))
             con.commit()
-            log.info("Índice %s actualizado: %d tickers", k, len(tickers))
+            log.info("Índice %s actualizado: %d tickers", k, len(rows))
 
     out = {}
     for k in wanted:
@@ -345,6 +354,105 @@ def match_indices(doc, index_map):
     t, c = norm_ticker(doc["ticker"]), doc["issuer_cik"]
     return [INDEX_SOURCES[k][3] for k, (tickers, ciks) in index_map.items()
             if (c and c in ciks) or (t and t in tickers)]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Contexto de la empresa: sector, capitalización, precio y rango 52 semanas
+# ═══════════════════════════════════════════════════════════════════════
+def _shares_outstanding(sec: SEC, cik):
+    """Acciones en circulación según la portada del último 10-K/10-Q (XBRL de la SEC)."""
+    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{int(cik):010d}/dei/EntityCommonStockSharesOutstanding.json"
+    facts = json.loads(sec.get(url))["units"]["shares"]
+    latest = max(facts, key=lambda f: (f.get("end", ""), f.get("filed", "")))
+    return float(latest["val"])
+
+
+def company_info(sec: SEC, con, cik, need_sic):
+    """(acciones en circulación, descripción SIC), con caché de 7 días."""
+    row = con.execute("SELECT shares, sic, updated FROM company_info WHERE cik=?", (cik,)).fetchone()
+    if row and datetime.now(timezone.utc) - datetime.fromisoformat(row[2]) < timedelta(days=7) \
+            and (row[1] or not need_sic):
+        return row[0], row[1]
+    shares = row[0] if row else None
+    sic = row[1] if row else None
+    try:
+        shares = _shares_outstanding(sec, cik)
+    except Exception as ex:
+        log.info("Sin acciones en circulación para CIK %s (%s)", cik, ex)
+    if need_sic and not sic:
+        try:
+            sub = json.loads(sec.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"))
+            sic = sub.get("sicDescription") or None
+        except Exception as ex:
+            log.info("Sin SIC para CIK %s (%s)", cik, ex)
+    con.execute("INSERT OR REPLACE INTO company_info VALUES (?,?,?,?)",
+                (cik, shares, sic, datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    return shares, sic
+
+
+def price_history(http, ticker):
+    """Precio actual y rango de 52 semanas (Yahoo Finance)."""
+    sym = re.sub(r"[./ ]", "-", ticker.upper().strip())
+    for host in ("query1", "query2"):
+        try:
+            r = http.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{sym}"
+                         "?range=1y&interval=1d", timeout=20)
+            if r.status_code != 200:
+                continue
+            res = r.json()["chart"]["result"][0]
+            meta, q = res["meta"], res["indicators"]["quote"][0]
+            highs = [x for x in q.get("high") or [] if x]
+            lows = [x for x in q.get("low") or [] if x]
+            closes = [x for x in q.get("close") or [] if x]
+            price = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+            hi = meta.get("fiftyTwoWeekHigh") or (max(highs) if highs else None)
+            lo = meta.get("fiftyTwoWeekLow") or (min(lows) if lows else None)
+            if price:
+                return {"price": float(price), "hi": hi and float(hi), "lo": lo and float(lo)}
+        except Exception as ex:
+            log.info("Yahoo %s (%s): %s", sym, host, ex)
+    return None
+
+
+def build_context(sec, con, http, doc, s):
+    """Junta sector, capitalización y precio. Nunca bloquea un aviso: si algo falla, se omite."""
+    ctx = {}
+    cik = doc["issuer_cik"]
+    row = con.execute(
+        "SELECT sector FROM index_members WHERE sector IS NOT NULL AND (cik=? OR ticker=?) LIMIT 1",
+        (cik, norm_ticker(doc["ticker"]))).fetchone()
+    ctx["sector"] = row[0] if row else None
+
+    shares, sic = (None, None)
+    if cik:
+        shares, sic = company_info(sec, con, cik, need_sic=not ctx["sector"])
+    ctx["sector"] = ctx["sector"] or sic
+
+    px = price_history(http, doc["ticker"]) if doc["ticker"] else None
+    ref_price = (px or {}).get("price") or s["avg_price"]
+    if shares and ref_price:
+        ctx["mcap"] = shares * ref_price
+        ctx["pct_mcap"] = s["value"] / ctx["mcap"] * 100
+    if px:
+        ctx["price"] = px["price"]
+        if s["avg_price"]:
+            ctx["vs_insider"] = (px["price"] / s["avg_price"] - 1) * 100
+        if px["hi"]:
+            ctx["from_hi"] = (px["price"] / px["hi"] - 1) * 100
+        if px["lo"]:
+            ctx["from_lo"] = (px["price"] / px["lo"] - 1) * 100
+    return ctx
+
+
+def fmt_cap(x):
+    m = x / 1e6
+    return f"{fmt_num(m / 1000, 1)} mil M$" if m >= 1000 else f"{fmt_num(m)} M$"
+
+
+def fmt_pct(x, dec=1, sign=True):
+    s = fmt_num(abs(x), dec)
+    return (("+" if x >= 0 else "−") if sign else "") + s + "%"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -447,7 +555,7 @@ def role_label(o):
     if o["director"]:
         parts.append("Consejero")
     if o["ten_percent"]:
-        parts.append(">10%")
+        parts.append("Accionista >10%")
     if not parts and o["title"]:
         parts.append(o["title"])
     return " · ".join(parts) or "Insider"
@@ -508,19 +616,35 @@ def cluster_info(con, doc, s):
 # ═══════════════════════════════════════════════════════════════════════
 # Mensajes
 # ═══════════════════════════════════════════════════════════════════════
-def build_message(doc, s, f, side, cluster=None):
+def build_message(doc, s, f, side, cluster=None, ctx=None):
     e = html.escape
+    ctx = ctx or {}
     owners = doc["owners"]
-    who = "; ".join(f"{e(o['name'])} — {e(role_label(o))}" for o in owners[:3])
+    who = "; ".join(f"{e(o['name'])} ({e(role_label(o))})" for o in owners[:3])
     if len(owners) > 3:
         who += f" (+{len(owners) - 3})"
 
     head = "🟢 <b>COMPRA INSIDER</b>" if side == "P" else "🔴 <b>VENTA INSIDER</b>"
     ticker = e(doc["ticker"] or "s/ticker")
     lines = [f"{head} — <b>${ticker}</b>" + ("  🔥 <b>CLUSTER</b>" if cluster else ""),
-             e(doc["issuer_name"]) + (f"  ·  🏷️ {e(' · '.join(doc['indices']))}" if doc.get("indices") else ""),
-             f"👤 {who}",
-             f"💵 <b>{fmt_money(s['value'])}</b> · {fmt_num(s['shares'])} acc. a {fmt_num(s['avg_price'], 2)} $"]
+             e(doc["issuer_name"]) + (f"  ·  🏷️ {e(' · '.join(doc['indices']))}" if doc.get("indices") else "")]
+
+    # Sector y capitalización
+    info = []
+    if ctx.get("sector"):
+        info.append(e(ctx["sector"]))
+    if ctx.get("mcap"):
+        info.append(f"Cap. {fmt_cap(ctx['mcap'])}")
+    if info:
+        lines.append("🏭 " + " · ".join(info))
+
+    lines.append(f"👤 {who}")
+    value = f"💵 <b>{fmt_money(s['value'])}</b>"
+    if ctx.get("pct_mcap") is not None:
+        p = ctx["pct_mcap"]
+        value += " (<0,01% de la cap.)" if p < 0.01 else f" ({fmt_num(p, 2)}% de la cap.)"
+    lines.append(f"{value} · {fmt_num(s['shares'])} acc. a {fmt_num(s['avg_price'], 2)} $")
+
     if s["pct"] is not None:
         tipo = "directa" if s["direct"] else "indirecta"
         if side == "P":
@@ -532,8 +656,27 @@ def build_message(doc, s, f, side, cluster=None):
     if cluster:
         lines.append(f"👥 {cluster['n']} insiders comprando en {CONFIG['cluster_window_days']} días "
                      f"· total {fmt_money(cluster['total'])}")
+
+    # Precio actual y rango de 52 semanas
+    if ctx.get("price"):
+        px = f"📊 Cotiza a {fmt_num(ctx['price'], 2)} $"
+        if ctx.get("vs_insider") is not None:
+            px += f" ({fmt_pct(ctx['vs_insider'])} vs. insider)"
+        lines.append(px)
+        rng = []
+        if ctx.get("from_hi") is not None:
+            rng.append(f"{fmt_pct(ctx['from_hi'])} desde máx. 52s")
+        if ctx.get("from_lo") is not None:
+            rng.append(f"{fmt_pct(ctx['from_lo'])} desde mín. 52s")
+        if rng:
+            lines.append("📐 " + " · ".join(rng))
+
     lines.append(f"📅 Operación: {s['date'] or '?'} · Presentado: {f['filed'] or '?'}")
-    lines.append(f"🔗 <a href=\"{e(f['index_url'])}\">Ver filing en EDGAR</a>")
+    links = [f"<a href=\"{e(f['index_url'])}\">EDGAR</a>"]
+    if doc["ticker"]:
+        q = requests.utils.quote(doc["ticker"])
+        links.append(f"<a href=\"https://es.investing.com/search/?q={q}\">Investing</a>")
+    lines.append("🔗 " + " · ".join(links))
     return "\n".join(lines)
 
 
@@ -559,8 +702,18 @@ def send_telegram(text, dry_run=False):
 # ═══════════════════════════════════════════════════════════════════════
 # Proceso principal
 # ═══════════════════════════════════════════════════════════════════════
-def process_filing(con, doc, f, dry_run=False, index_map=None):
+def process_filing(con, doc, f, dry_run=False, index_map=None, sec=None, http=None):
     """Evalúa un Form 4 ya parseado. Devuelve el nº de avisos enviados."""
+
+    def context(s):
+        if not (CONFIG["enrich"] and sec and http):
+            return {}
+        try:
+            return build_context(sec, con, http, doc, s)
+        except Exception as ex:
+            log.info("Sin contexto para %s: %s", doc["ticker"], ex)
+            return {}
+
     if not passes_watchlist(doc) or not passes_role(doc):
         return 0
     doc["indices"] = match_indices(doc, index_map or {})
@@ -575,14 +728,14 @@ def process_filing(con, doc, f, dry_run=False, index_map=None):
         con.execute("INSERT OR IGNORE INTO buys VALUES (?,?,?,?,?,?)",
                     (f["accession"], doc["issuer_cik"], doc["ticker"], owner, buy["date"], buy["value"]))
         con.commit()
-        send_telegram(build_message(doc, buy, f, "P", cluster_info(con, doc, buy)), dry_run)
+        send_telegram(build_message(doc, buy, f, "P", cluster_info(con, doc, buy), context(buy)), dry_run)
         sent += 1
 
     if CONFIG["alert_sells"]:
         sell = summarize(doc, "S")
         if sell and sell["value"] >= CONFIG["min_sell_value"] and \
                 (not CONFIG["min_pct_sold"] or (sell["pct"] or 0) >= CONFIG["min_pct_sold"]):
-            send_telegram(build_message(doc, sell, f, "S"), dry_run)
+            send_telegram(build_message(doc, sell, f, "S", ctx=context(sell)), dry_run)
             sent += 1
     return sent
 
@@ -591,7 +744,9 @@ def run_once(dry_run=False):
     sec = SEC(SEC_USER_AGENT, CONFIG["request_delay"])
     # En --dry-run se usa una base temporal: no marca nada como visto
     con = db_open(":memory:" if dry_run else CONFIG["db_path"])
-    index_map = load_indices(sec, con)
+    http = requests.Session()
+    http.headers.update({"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
+    index_map = load_indices(sec, con, http)
     if CONFIG["indices"] and not index_map:
         log.warning("No hay listas de índices disponibles: esta pasada NO filtra por índice")
     filings = fetch_new_filings(sec, con)
@@ -600,7 +755,7 @@ def run_once(dry_run=False):
     for f in filings:
         try:
             doc = parse_form4(fetch_form4_xml(sec, f))
-            alerts += process_filing(con, doc, f, dry_run, index_map)
+            alerts += process_filing(con, doc, f, dry_run, index_map, sec, http)
             db_mark(con, f["accession"])
         except Exception as ex:  # se reintentará en la próxima pasada
             log.warning("Error en %s: %s", f["accession"], ex)
