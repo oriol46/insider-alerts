@@ -1485,6 +1485,8 @@ def run_check(conn):
         more = f"\n… y {len(errors) - 10} más" if len(errors) > 10 else ""
         send_telegram(f"⚠️ <b>Earnings Alerts</b>: {len(errors)} análisis fallidos (se reintentan solos)\n{lines}{more}")
     run_europe(conn)
+    if summary_due(conn):          # por si la ejecución programada del resumen se ha retrasado o perdido
+        run_summary(conn)
     if ALPHAVANTAGE_API_KEY:
         run_calls(conn)
 
@@ -1558,11 +1560,30 @@ def run_calls(conn, dry_run=False):
                           f"({esc(row['analysis'].get('periodo'))}). Puedes analizarla a mano más adelante.", dry_run)
 
 
+SUMMARY_TIME = os.environ.get("SUMMARY_TIME", "07:45")   # hora de Madrid a partir de la cual se envía el resumen
+
+
+def _madrid_now():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Europe/Madrid"))
+
+
+def summary_due(conn):
+    """True si toca el resumen: de martes a sábado, a partir de SUMMARY_TIME (Madrid) y aún no enviado hoy."""
+    now = _madrid_now()
+    if now.isoweekday() not in (2, 3, 4, 5, 6) or now.strftime("%H:%M") < SUMMARY_TIME:
+        return False
+    row = conn.execute("SELECT value FROM meta WHERE key='summary_date'").fetchone()
+    return not row or row[0] != now.date().isoformat()
+
+
 def run_summary(conn, dry_run=False):
     rows = conn.execute("""SELECT accession, ticker, name, sector, filing_date, url, analysis FROM filings
                            WHERE status='ok' AND summarized=0 ORDER BY sector, ticker""").fetchall()
     if not rows:
         log("No hay resultados nuevos para el resumen")
+        if not dry_run:
+            _mark_summary_sent(conn)
         return
     items = [{"accession": r[0], "ticker": r[1], "name": r[2], "sector": r[3], "filing_date": r[4],
               "url": r[5], "analysis": json.loads(r[6])} for r in rows]
@@ -1600,8 +1621,14 @@ def run_summary(conn, dry_run=False):
     send_blocks(header, blocks, dry_run)
     if not dry_run:
         conn.executemany("UPDATE filings SET summarized=1 WHERE accession=?", [(i["accession"],) for i in items])
-        conn.commit()
+        _mark_summary_sent(conn)
     log(f"Resumen enviado: {len(items)} empresas")
+
+
+def _mark_summary_sent(conn):
+    conn.execute("REPLACE INTO meta VALUES ('summary_date', ?, ?)",
+                 (_madrid_now().date().isoformat(), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
 
 
 def run_ticker(conn, ticker, dry_run=False):
@@ -1645,6 +1672,7 @@ def run_call_now(conn, ticker, dry_run=False):
 def main():
     p = argparse.ArgumentParser(description="Resultados del S&P 500 por Telegram")
     p.add_argument("--summary", action="store_true", help="envía el resumen de resultados pendientes")
+    p.add_argument("--auto", action="store_true", help="con --summary: solo si toca (hora y día) y no se ha enviado hoy")
     p.add_argument("--ticker", help="analiza el último resultado de una empresa y lo envía")
     p.add_argument("--call", help="analiza el último resultado de una empresa junto con su call")
     p.add_argument("--inbox", action="store_true", help="analiza las transcripciones enviadas al bot por Telegram")
@@ -1673,6 +1701,8 @@ def main():
         run_call_now(conn, args.call, args.dry_run)
     elif args.ticker:
         run_ticker(conn, args.ticker, args.dry_run)
+    elif args.summary and args.auto and not summary_due(conn):
+        log("El resumen de hoy ya se ha enviado o aún no es la hora")
     elif args.summary:
         run_summary(conn, args.dry_run)
     else:
